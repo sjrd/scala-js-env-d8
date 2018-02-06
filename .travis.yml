@@ -1,0 +1,45 @@
+sudo: false
+language: scala
+scala:
+  - 2.10.7
+  - 2.11.12
+  - 2.12.4
+jdk:
+  - oraclejdk8
+env:
+  global:
+    v8: 6.6.168
+
+# Magic to install d8
+before_script:
+  - g++ -v
+  - gcc -v
+  - pushd ..
+  - git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
+  - export PATH="$PATH":`pwd`/depot_tools
+  - popd
+  - pushd ..
+  - fetch v8; cd v8
+  - git checkout $v8 && gclient sync > /dev/null
+  - git describe --always
+  - tools/dev/v8gen.py x64.release
+  - ninja -C out.gn/x64.release d8
+  - export D8PATH=`pwd`/out.gn/x64.release/d8
+  - popd
+  - $D8PATH -e 'print(version());'
+
+script:
+  - |
+      if [[ "${TRAVIS_SCALA_VERSION}" != "2.10.7" ]]; then
+        sbt -Dbe.doeraene.scalajsd8env.d8executable=$D8PATH ++$TRAVIS_SCALA_VERSION test-project/run test-project/test
+      fi
+  - sbt -Dbe.doeraene.scalajsd8env.d8executable=$D8PATH ++$TRAVIS_SCALA_VERSION scalajs-env-d8/test scalajs-env-d8/doc
+
+cache:
+  directories:
+    - $HOME/.ivy2/cache
+    - $HOME/.sbt
+    - $HOME/.coursier/cache
+before_cache:
+  - find $HOME/.ivy2/cache -name "ivydata-*.properties" -print -delete
+  - find $HOME/.sbt -name "*.lock" -print -delete
