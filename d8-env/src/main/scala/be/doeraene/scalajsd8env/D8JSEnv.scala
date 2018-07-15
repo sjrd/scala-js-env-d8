@@ -165,7 +165,7 @@ class D8JSEnv(config: D8JSEnv.Config) extends JSEnv {
       } yield {
         val fileName = materialize(f).getAbsolutePath
         s"load('${escapeJS(fileName)}');"
-      }).mkString("\n")
+      }).mkString("\n  ")
 
       val workerScript =
         s"""
@@ -213,7 +213,11 @@ class D8JSEnv(config: D8JSEnv.Config) extends JSEnv {
           |    print("$D8ComMessagePrefix");
           |  }
           |};
-          |$loadJSFiles
+          |try {
+          |  $loadJSFiles
+          |} catch (error) {
+          |  quit(1); // the stack trace has already been displayed by d8
+          |}
         """.stripMargin
 
       MemVirtualBinaryFile.fromStringUTF8("launcher.js",
