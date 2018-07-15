@@ -1,5 +1,7 @@
 package be.doeraene.scalajsd8env
 
+import scala.annotation.tailrec
+
 import scala.collection.immutable
 import scala.collection.mutable
 
@@ -90,26 +92,32 @@ class D8JSEnv(config: D8JSEnv.Config) extends JSEnv {
       }
     }
 
-    // In this queue, a None element is a sentinel for a closed channel
-    private[this] val jvm2js = new LinkedBlockingQueue[Option[String]]()
+    private[this] val jvm2js = new LinkedBlockingQueue[JVMToJSAction]()
 
     private def writeJVMToJS(outputStream: OutputStream): Unit = {
+      import JVMToJSAction._
+
+      var shouldClose = true
+      val writer = new OutputStreamWriter(outputStream, UTF_8)
       try {
-        val writer = new OutputStreamWriter(outputStream, UTF_8)
-        try {
-          var msg: Option[String] = jvm2js.take()
-          while (msg.isDefined) {
-            val encoded = base16Encode(msg.get)
-            writer.write(encoded + "\n")
-            writer.flush()
-            msg = jvm2js.take()
+        @tailrec
+        def loop(): Boolean = {
+          jvm2js.take() match {
+            case Send(msg) =>
+              val encoded = base16Encode(msg)
+              writer.write(encoded + "\n")
+              writer.flush()
+              loop()
+            case Close =>
+              true
+            case StopWithoutClosing =>
+              false
           }
-        } finally {
-          writer.close()
         }
-      } catch {
-        case t: IOException =>
-          t.printStackTrace()
+        shouldClose = loop()
+      } finally {
+        if (shouldClose)
+          writer.close()
       }
     }
 
@@ -124,7 +132,10 @@ class D8JSEnv(config: D8JSEnv.Config) extends JSEnv {
               if (line.startsWith(D8ComMessagePrefix)) {
                 val encoded = line.stripPrefix(D8ComMessagePrefix)
                 if (encoded == "") {
-                  ComD8Run.this.close()
+                  jvm2js.offer(JVMToJSAction.Close)
+                  line = null
+                } else if (encoded == "x") {
+                  jvm2js.offer(JVMToJSAction.StopWithoutClosing)
                   line = null
                 } else {
                   onMessage(base16Decode(encoded))
@@ -216,6 +227,7 @@ class D8JSEnv(config: D8JSEnv.Config) extends JSEnv {
           |try {
           |  $loadJSFiles
           |} catch (error) {
+          |  print("$D8ComMessagePrefix" + "x");
           |  quit(1); // the stack trace has already been displayed by d8
           |}
         """.stripMargin
@@ -235,10 +247,10 @@ class D8JSEnv(config: D8JSEnv.Config) extends JSEnv {
     def future: Future[Unit] = underlyingRun.future
 
     def send(msg: String): Unit =
-      jvm2js.offer(Some(msg))
+      jvm2js.offer(JVMToJSAction.Send(msg))
 
     def close(): Unit =
-      jvm2js.offer(None)
+      jvm2js.offer(JVMToJSAction.Close)
   }
 
 }
@@ -250,6 +262,14 @@ object D8JSEnv {
 
   private val DefaultD8Executable =
     System.getProperty("be.doeraene.scalajsd8env.d8executable", "d8")
+
+  private sealed abstract class JVMToJSAction
+
+  private object JVMToJSAction {
+    final case class Send(msg: String) extends JVMToJSAction
+    final case object Close extends JVMToJSAction
+    final case object StopWithoutClosing extends JVMToJSAction
+  }
 
   private def scriptFiles(input: Input): List[VirtualBinaryFile] = input match {
     case Input.ScriptsToLoad(scripts) => scripts
