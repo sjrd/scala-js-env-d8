@@ -108,8 +108,8 @@ class D8JSEnv(config: D8JSEnv.Config) extends JSEnv {
           writer.close()
         }
       } catch {
-        case _: EOFException =>
-          // Happens when the VM crashes. Let ExternalJSEnv take care of the failure.
+        case t: IOException =>
+          t.printStackTrace()
       }
     }
 
