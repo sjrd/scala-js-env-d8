@@ -94,17 +94,22 @@ class D8JSEnv(config: D8JSEnv.Config) extends JSEnv {
     private[this] val jvm2js = new LinkedBlockingQueue[Option[String]]()
 
     private def writeJVMToJS(outputStream: OutputStream): Unit = {
-      val writer = new OutputStreamWriter(outputStream, UTF_8)
       try {
-        var msg: Option[String] = jvm2js.take()
-        while (msg.isDefined) {
-          val encoded = base16Encode(msg.get)
-          writer.write(encoded + "\n")
-          writer.flush()
-          msg = jvm2js.take()
+        val writer = new OutputStreamWriter(outputStream, UTF_8)
+        try {
+          var msg: Option[String] = jvm2js.take()
+          while (msg.isDefined) {
+            val encoded = base16Encode(msg.get)
+            writer.write(encoded + "\n")
+            writer.flush()
+            msg = jvm2js.take()
+          }
+        } finally {
+          writer.close()
         }
-      } finally {
-        writer.close()
+      } catch {
+        case _: EOFException =>
+          // Happens when the VM crashes. Let ExternalJSEnv take care of the failure.
       }
     }
 
