@@ -5,9 +5,12 @@ import scala.collection.mutable
 
 import scala.concurrent.{Future, Promise}
 import scala.util.Try
+import scala.util.control.NonFatal
 
-import java.io.{ Console => _, _ }
+import java.io._
 import java.nio.charset.StandardCharsets.UTF_8
+import java.nio.file.{Files, StandardCopyOption}
+import java.net.URI
 import java.util.concurrent.{LinkedBlockingQueue, TimeUnit}
 
 import org.scalajs.io._
@@ -19,149 +22,143 @@ import org.scalajs.jsenv._
 import scala.concurrent.TimeoutException
 import scala.concurrent.duration._
 
-class D8JSEnv(config: D8JSEnv.Config) extends ExternalJSEnv with ComJSEnv {
+class D8JSEnv(config: D8JSEnv.Config) extends JSEnv {
   import D8JSEnv._
 
   def this() = this(D8JSEnv.Config())
 
-  protected def vmName: String = "d8"
+  val name: String = "d8"
 
-  protected def executable: String = config.executable
+  def start(input: Input, runConfig: RunConfig): JSRun = {
+    D8JSEnv.validator.validate(runConfig)
+    try {
+      val files = scriptFiles(input).map(materialize(_).getPath)
+      val command = config.executable :: config.args ::: files
+      val externalConfig = ExternalJSRun.Config()
+        .withEnv(config.env)
+        .withRunConfig(runConfig)
+      ExternalJSRun.start(command, externalConfig)(_.close())
+    } catch {
+      case NonFatal(t) =>
+        JSRun.failed(t)
 
-  override protected def args: immutable.Seq[String] = config.args
-
-  override protected def env: Map[String, String] = config.env
-
-  override def jsRunner(files: Seq[VirtualJSFile]): JSRunner =
-    new D8Runner(files)
-
-  override def asyncRunner(files: Seq[VirtualJSFile]): AsyncJSRunner =
-    new AsyncD8Runner(files)
-
-  override def comRunner(files: Seq[VirtualJSFile]): ComJSRunner =
-    new ComD8Runner(files)
-
-  protected trait AbstractD8Runner extends AbstractExtRunner {
-    protected[this] val libCache = new VirtualFileMaterializer(true)
-
-    override protected def getVMArgs(): Seq[String] =
-      args ++ getJSFiles().map(f => libCache.materialize(f).getAbsolutePath)
+      case t: NotImplementedError =>
+        /* In Scala 2.10.x, NotImplementedError was considered fatal.
+         * We need this case for the conformance tests to pass on 2.10.
+         */
+        JSRun.failed(t)
+    }
   }
 
-  protected class D8Runner(files: Seq[VirtualJSFile])
-      extends ExtRunner(files) with AbstractD8Runner
+  def startWithCom(input: Input, runConfig: RunConfig,
+      onMessage: String => Unit): JSComRun = {
+    D8JSEnv.validator.validate(runConfig)
+    try {
+      new ComD8Run(input, runConfig, onMessage)
+    } catch {
+      case NonFatal(t) =>
+        JSComRun.failed(t)
 
-  protected class AsyncD8Runner(files: Seq[VirtualJSFile])
-      extends AsyncExtRunner(files) with AbstractD8Runner
-
-  // This works around some obscure thing with `abstract override def stop()`
-  protected class ComD8Runner(files: Seq[VirtualJSFile])
-      extends AbstractComD8Runner(files) with ComJSRunner {
-    override def stop(): Unit = super.stop()
+      case t: NotImplementedError =>
+        /* In Scala 2.10.x, NotImplementedError was considered fatal.
+         * We need this case for the conformance tests to pass on 2.10.
+         * Non-fatal exceptions are already handled by ComRun.start().
+         */
+        JSComRun.failed(t)
+    }
   }
 
-  protected abstract class AbstractComD8Runner(files: Seq[VirtualJSFile])
-      extends AbstractExtRunner(files) with AbstractD8Runner {
+  private class ComD8Run(input: Input, runConfig: RunConfig,
+      onMessage: String => Unit)
+      extends JSComRun {
 
-    private[this] var vmInst: Process = null
-    private[this] val promise = Promise[Unit]
-
-    // In these queues, a None element is a sentinel for a closed channel
-    private[this] val jvm2js = new LinkedBlockingQueue[Option[String]]()
-    private[this] val js2jvm = new LinkedBlockingQueue[Option[String]]()
-
-    private[this] val jvm2jsThread = new Thread {
-      override def run(): Unit = {
-        val writer = new OutputStreamWriter(vmInst.getOutputStream(), UTF_8)
-        try {
-          var msg: Option[String] = jvm2js.take()
-          while (msg.isDefined) {
-            val encoded = base16Encode(msg.get)
-            writer.write(encoded + "\n")
-            writer.flush()
-            msg = jvm2js.take()
-          }
-        } finally {
-          writer.close()
-        }
+    private val stdoutStreams = {
+      if (runConfig.inheritOutput) {
+        None
+      } else {
+        val is = new PipedInputStream()
+        val osw = new OutputStreamWriter(new PipedOutputStream(is), UTF_8)
+        Some((is, osw))
       }
     }
 
-    private[this] val js2jvmThread = new Thread {
+    private def sendToStdout(line: String): Unit = {
+      stdoutStreams.fold {
+        System.out.println(line)
+      } { pair =>
+        pair._2.write(line + "\n")
+      }
+    }
+
+    // In this queue, a None element is a sentinel for a closed channel
+    private[this] val jvm2js = new LinkedBlockingQueue[Option[String]]()
+
+    private def writeJVMToJS(outputStream: OutputStream): Unit = {
+      val writer = new OutputStreamWriter(outputStream, UTF_8)
+      try {
+        var msg: Option[String] = jvm2js.take()
+        while (msg.isDefined) {
+          val encoded = base16Encode(msg.get)
+          writer.write(encoded + "\n")
+          writer.flush()
+          msg = jvm2js.take()
+        }
+      } finally {
+        writer.close()
+      }
+    }
+
+    private class JSToJVMThread(inputStream: InputStream) extends Thread {
       override def run(): Unit = {
         val pipeResult = Try {
-          val reader = new BufferedReader(new InputStreamReader(
-              vmInst.getInputStream(), UTF_8))
+          val reader =
+            new BufferedReader(new InputStreamReader(inputStream, UTF_8))
           try {
             var line: String = reader.readLine()
             while (line != null) {
               if (line.startsWith(D8ComMessagePrefix)) {
                 val encoded = line.stripPrefix(D8ComMessagePrefix)
                 if (encoded == "") {
-                  AbstractComD8Runner.this.close()
+                  ComD8Run.this.close()
                   line = null
                 } else {
-                  js2jvm.offer(Some(base16Decode(encoded)))
+                  onMessage(base16Decode(encoded))
                   line = reader.readLine()
                 }
               } else {
-                console.log(line)
+                sendToStdout(line)
                 line = reader.readLine()
               }
             }
           } finally {
-            js2jvm.offer(None)
             reader.close()
           }
         }
-
-        val vmComplete = Try(waitForVM(vmInst))
-
-        // Chain Try's the other way: We want VM failure first, then IO failure
-        promise.complete(pipeResult.orElse(vmComplete))
       }
     }
 
-    def future: Future[Unit] = promise.future
+    private val underlyingRun = {
+      val launcher = materialize(makeLauncher()).getAbsolutePath
+      val command = config.executable :: config.args ::: launcher :: Nil
 
-    def start(logger: Logger, console: JSConsole): Future[Unit] = {
-      setupLoggerAndConsole(logger, console)
-      startExternalJSEnv()
-      future
+      val underlyingRunConfig = runConfig
+        .withInheritOut(false)
+        .withOnOutputStream { (underlyingStdout, stderr) =>
+          new JSToJVMThread(underlyingStdout.get).start()
+          runConfig.onOutputStream.foreach(_(stdoutStreams.map(_._1), stderr))
+        }
+
+      val externalConfig = ExternalJSRun.Config()
+        .withEnv(config.env)
+        .withRunConfig(underlyingRunConfig)
+      ExternalJSRun.start(command, externalConfig)(writeJVMToJS(_))
     }
 
-    /** Core functionality of [[start]].
-     *
-     *  Same as [[start]] but without a call to [[setupLoggerAndConsole]] and
-     *  not returning [[future]].
-     *  Useful to be called in overrides of [[start]].
-     */
-    protected def startExternalJSEnv(): Unit = {
-      require(vmInst == null, "start() may only be called once")
-      vmInst = startVM()
-      jvm2jsThread.start()
-      js2jvmThread.start()
-    }
-
-    def close(): Unit = {
-      jvm2js.offer(None)
-    }
-
-    def stop(): Unit = {
-      require(vmInst != null, "start() must have been called")
-      close()
-      js2jvm.offer(None)
-      vmInst.destroy()
-    }
-
-    override protected def getVMArgs(): Seq[String] =
-      args :+ libCache.materialize(launcher()).getAbsolutePath
-
-    private def launcher(): VirtualJSFile = {
+    private def makeLauncher(): VirtualBinaryFile = {
       val loadJSFiles = (for {
-        f <- getJSFiles()
+        f <- scriptFiles(input)
       } yield {
-        val fileName = libCache.materialize(f).getAbsolutePath
+        val fileName = materialize(f).getAbsolutePath
         s"load('${escapeJS(fileName)}');"
       }).mkString("\n")
 
@@ -214,7 +211,7 @@ class D8JSEnv(config: D8JSEnv.Config) extends ExternalJSEnv with ComJSEnv {
           |$loadJSFiles
         """.stripMargin
 
-      new MemVirtualJSFile("launcher.js").withContent(
+      MemVirtualBinaryFile.fromStringUTF8("launcher.js",
           s"""
             |var worker = new Worker("${escapeJS(workerScript)}");
             |var line;
@@ -226,78 +223,98 @@ class D8JSEnv(config: D8JSEnv.Config) extends ExternalJSEnv with ComJSEnv {
           """.stripMargin)
     }
 
-    private def base16Encode(msg: String): String = {
-      val result = new java.lang.StringBuilder(msg.length * 2)
+    def future: Future[Unit] = underlyingRun.future
 
-      def appendByte(b: Int): Unit = {
-        result.append(('A' + ((b & 0xf0) >>> 4)).toChar)
-        result.append(('A' + (b & 0x0f)).toChar)
-      }
-
-      for (c <- msg) {
-        if (c < 0x100) {
-          appendByte(c.toInt)
-        } else {
-          result.append('u')
-          appendByte(c >>> 8)
-          appendByte(c)
-        }
-      }
-      result.toString()
-    }
-
-    private def base16Decode(msg: String): String = {
-      val len = msg.length
-      val result = new java.lang.StringBuilder(len / 2)
-
-      def readByteAt(i: Int): Int =
-        ((msg.charAt(i) - 'A') << 4) | (msg.charAt(i + 1) - 'A')
-
-      var i = 0
-      while (i != len) {
-        if (msg.charAt(i) != 'u') {
-          result.append(readByteAt(i).toChar)
-          i += 2
-        } else {
-          result.append(((readByteAt(i + 1) << 8) | readByteAt(i + 3)).toChar)
-          i += 5
-        }
-      }
-
-      result.toString()
-    }
-
-    def send(msg: String): Unit = {
+    def send(msg: String): Unit =
       jvm2js.offer(Some(msg))
-    }
 
-    def receive(timeout: Duration): String = {
-      val result = {
-        if (timeout.isFinite()) {
-          val result = js2jvm.poll(timeout.toMillis, TimeUnit.MILLISECONDS)
-          if (result == null)
-            throw new TimeoutException("Timeout expired")
-          result
-        } else {
-          js2jvm.take()
-        }
-      }
-      result.getOrElse {
-        js2jvm.offer(None) // put it back in, in case receive() is called again
-        throw new ComJSEnv.ComClosedException
-      }
-    }
-
-    override protected def finalize(): Unit = close()
+    def close(): Unit =
+      jvm2js.offer(None)
   }
 
 }
 
 object D8JSEnv {
+  private lazy val validator = ExternalJSRun.supports(RunConfig.Validator())
+
   private final val D8ComMessagePrefix = "@__ScalaJSD8JSEnvComMessage__@"
 
   private val DefaultD8Executable =
     System.getProperty("be.doeraene.scalajsd8env.d8executable", "d8")
+
+  private def scriptFiles(input: Input): List[VirtualBinaryFile] = input match {
+    case Input.ScriptsToLoad(scripts) => scripts
+    case _                            => throw new UnsupportedInputException(input)
+  }
+
+  // tmpSuffixRE and tmpFile copied from HTMLRunnerBuilder.scala in Scala.js
+
+  private val tmpSuffixRE = """[a-zA-Z0-9-_.]*$""".r
+
+  private def tmpFile(path: String, in: InputStream): File = {
+    try {
+      /* - createTempFile requires a prefix of at least 3 chars
+       * - we use a safe part of the path as suffix so the extension stays (some
+       *   browsers need that) and there is a clue which file it came from.
+       */
+      val suffix = tmpSuffixRE.findFirstIn(path).orNull
+
+      val f = File.createTempFile("tmp-", suffix)
+      f.deleteOnExit()
+      Files.copy(in, f.toPath(), StandardCopyOption.REPLACE_EXISTING)
+      f
+    } finally {
+      in.close()
+    }
+  }
+
+  private def materialize(file: VirtualBinaryFile): File = {
+    file match {
+      case file: FileVirtualFile => file.file
+      case file                  => tmpFile(file.path, file.inputStream)
+    }
+  }
+
+  private def base16Encode(msg: String): String = {
+    val result = new java.lang.StringBuilder(msg.length * 2)
+
+    def appendByte(b: Int): Unit = {
+      result.append(('A' + ((b & 0xf0) >>> 4)).toChar)
+      result.append(('A' + (b & 0x0f)).toChar)
+    }
+
+    for (c <- msg) {
+      if (c < 0x100) {
+        appendByte(c.toInt)
+      } else {
+        result.append('u')
+        appendByte(c >>> 8)
+        appendByte(c)
+      }
+    }
+    result.toString()
+  }
+
+  private def base16Decode(msg: String): String = {
+    val len = msg.length
+    val result = new java.lang.StringBuilder(len / 2)
+
+    def readByteAt(i: Int): Int =
+      ((msg.charAt(i) - 'A') << 4) | (msg.charAt(i + 1) - 'A')
+
+    var i = 0
+    while (i != len) {
+      if (msg.charAt(i) != 'u') {
+        result.append(readByteAt(i).toChar)
+        i += 2
+      } else {
+        result.append(((readByteAt(i + 1) << 8) | readByteAt(i + 3)).toChar)
+        i += 5
+      }
+    }
+
+    result.toString()
+  }
 
   final class Config private (
       val executable: String,
