@@ -10,5 +10,6 @@ class D8JSSuite extends JSEnvSuite(D8JSSuite.Config)
 object D8JSSuite {
   val Config = {
     JSEnvSuiteConfig(new D8JSEnv)
+      .withAwaitTimepout(scala.concurrent.duration.DurationInt(5).seconds)
   }
 }
