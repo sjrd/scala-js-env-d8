@@ -88,7 +88,9 @@ class D8JSEnv(config: D8JSEnv.Config) extends JSEnv {
       stdoutStreams.fold {
         System.out.println(line)
       } { pair =>
-        pair._2.write(line + "\n")
+        val osw = pair._2
+        osw.write(line + "\n")
+        osw.flush()
       }
     }
 
